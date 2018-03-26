@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
+
 def _gaussian(
         size=3, sigma=0.25, amplitude=1, normalize=False, width=None,
         height=None, sigma_horz=None, sigma_vert=None, mean_horz=0.5,
@@ -99,14 +100,15 @@ def crop(image, center, scale, resolution=256.0):
     oldY = np.array([max(1, ul[1] + 1), min(br[1], ht)], dtype=np.int32)
     newImg[newY[0] - 1:newY[1], newX[0] - 1:newX[1]
            ] = image[oldY[0] - 1:oldY[1], oldX[0] - 1:oldX[1], :]
-    #newImg = Image.fromarray(np.uint8((newImg)*255))
-    #newImg.resize((int(resolution), int(resolution)),Image.ANTIALIAS)
-    #newImg = np.array(newImg)/255
-    #print(newImg.type())
     newImg = cv2.resize(newImg, dsize=(int(resolution), int(resolution)),
                         interpolation=cv2.INTER_LINEAR)
     return newImg
 
+def resizeImg(image, resolution=256.0):
+    newImg = image
+    newImg = cv2.resize(newImg, dsize=(int(resolution), int(resolution)),
+                        interpolation=cv2.INTER_LINEAR)
+    return newImg
 
 def get_preds_fromhm(hm, center=None, scale=None):
     max, idx = torch.max(
@@ -137,3 +139,129 @@ def get_preds_fromhm(hm, center=None, scale=None):
 
     return preds, preds_orig
 
+def get_preds_straight(hm, center=None, scale=None):
+    max, idx = torch.max(
+        hm.view(hm.size(0), hm.size(1), hm.size(2) * hm.size(3)), 2)
+    idx += 1
+    preds = idx.view(idx.size(0), idx.size(1), 1).repeat(1, 1, 2).float()
+    preds[..., 0].apply_(lambda x: (x - 1) % hm.size(3) + 1)
+    preds[..., 1].add_(-1).div_(hm.size(2)).floor_().add_(1)
+
+    for i in range(preds.size(0)):
+        for j in range(preds.size(1)):
+            hm_ = hm[i, j, :]
+            pX, pY = int(preds[i, j, 0]) - 1, int(preds[i, j, 1]) - 1
+            if pX > 0 and pX < 63 and pY > 0 and pY < 63:
+                diff = torch.FloatTensor(
+                    [hm_[pY, pX + 1] - hm_[pY, pX - 1],
+                     hm_[pY + 1, pX] - hm_[pY - 1, pX]])
+                preds[i, j].add_(diff.sign_().mul_(.25))
+
+    preds.add_(-.5)
+
+    preds_orig = torch.zeros(preds.size())
+    if center is not None and scale is not None:
+        for i in range(hm.size(0)):
+            for j in range(hm.size(1)):
+                preds_orig[i, j] = transform(
+                    preds[i, j], center, scale, hm.size(2), True)
+
+    return preds, preds_orig
+# From pyzolib/paths.py (https://bitbucket.org/pyzo/pyzolib/src/tip/paths.py)
+
+
+def appdata_dir(appname=None, roaming=False):
+    """ appdata_dir(appname=None, roaming=False)
+
+    Get the path to the application directory, where applications are allowed
+    to write user specific files (e.g. configurations). For non-user specific
+    data, consider using common_appdata_dir().
+    If appname is given, a subdir is appended (and created if necessary).
+    If roaming is True, will prefer a roaming directory (Windows Vista/7).
+    """
+
+    # Define default user directory
+    userDir = os.getenv('FACEALIGNMENT_USERDIR', None)
+    if userDir is None:
+        userDir = os.path.expanduser('~')
+        if not os.path.isdir(userDir):  # pragma: no cover
+            userDir = '/var/tmp'  # issue #54
+
+    # Get system app data dir
+    path = None
+    if sys.platform.startswith('win'):
+        path1, path2 = os.getenv('LOCALAPPDATA'), os.getenv('APPDATA')
+        path = (path2 or path1) if roaming else (path1 or path2)
+    elif sys.platform.startswith('darwin'):
+        path = os.path.join(userDir, 'Library', 'Application Support')
+    # On Linux and as fallback
+    if not (path and os.path.isdir(path)):
+        path = userDir
+
+    # Maybe we should store things local to the executable (in case of a
+    # portable distro or a frozen application that wants to be portable)
+    prefix = sys.prefix
+    if getattr(sys, 'frozen', None):
+        prefix = os.path.abspath(os.path.dirname(sys.executable))
+    for reldir in ('settings', '../settings'):
+        localpath = os.path.abspath(os.path.join(prefix, reldir))
+        if os.path.isdir(localpath):  # pragma: no cover
+            try:
+                open(os.path.join(localpath, 'test.write'), 'wb').close()
+                os.remove(os.path.join(localpath, 'test.write'))
+            except IOError:
+                pass  # We cannot write in this directory
+            else:
+                path = localpath
+                break
+
+    # Get path specific for this app
+    if appname:
+        if path == userDir:
+            appname = '.' + appname.lstrip('.')  # Make it a hidden directory
+        path = os.path.join(path, appname)
+        if not os.path.isdir(path):  # pragma: no cover
+            os.mkdir(path)
+
+    # Done
+    return path
+
+
+def shuffle_lr(parts, pairs=None):
+    if pairs is None:
+        pairs = [[0, 16], [1, 15], [2, 14], [3, 13], [4, 12], [5, 11], [6, 10],
+                 [7, 9], [17, 26], [18, 25], [19, 24], [20, 23], [21, 22], [36, 45],
+                 [37, 44], [38, 43], [39, 42], [41, 46], [40, 47], [31, 35], [32, 34],
+                 [50, 52], [49, 53], [48, 54], [61, 63], [60, 64], [67, 65], [59, 55], [58, 56]]
+    for matched_p in pairs:
+        idx1, idx2 = matched_p[0], matched_p[1]
+        tmp = np.copy(parts[..., idx1])
+        np.copyto(parts[..., idx1], parts[..., idx2])
+        np.copyto(parts[..., idx2], tmp)
+    return parts
+
+
+def flip(tensor, is_label=False):
+    was_cuda = False
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.numpy()
+    elif isinstance(tensor, torch.cuda.FloatTensor):
+        tensor = tensor.cpu().numpy()
+        was_cuda = True
+
+    was_squeezed = False
+    if tensor.ndim == 4:
+        tensor = np.squeeze(tensor)
+        was_squeezed = True
+    if is_label:
+        tensor = tensor.swapaxes(0, 1).swapaxes(1, 2)
+        tensor = cv2.flip(shuffle_lr(tensor), 1).reshape(tensor.shape)
+        tensor = tensor.swapaxes(2, 1).swapaxes(1, 0)
+    else:
+        tensor = cv2.flip(tensor, 1).reshape(tensor.shape)
+    if was_squeezed:
+        tensor = np.expand_dims(tensor, axis=0)
+    tensor = torch.from_numpy(tensor)
+    if was_cuda:
+        tensor = tensor.cuda()
+    return tensor
